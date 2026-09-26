@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import scipy.sparse
@@ -27,7 +28,22 @@ _METRICS = {
 _GPU_USABLE = None
 _I32 = np.iinfo(np.int32)
 _F32 = np.finfo(np.float32)
+_FANOUT_WORKERS = 8
+_KNN_FANOUT_MIN_ROWS = 128
 
+
+def _fan_out_rows(count: int, minimum: int, run) -> None:
+    """Run a row-ranged kernel, splitting the rows over a thread pool."""
+    if count >= minimum and (os.cpu_count() or 1) > 1:
+        parts = min(_FANOUT_WORKERS, count)
+        bounds = [
+            (count * part // parts, count * (part + 1) // parts)
+            for part in range(parts)
+        ]
+        with ThreadPoolExecutor(parts) as executor:
+            list(executor.map(run, bounds))
+    else:
+        run((0, count))
 
 def _as_i32_indices(values, name: str) -> np.ndarray:
     array = np.asarray(values)
@@ -94,15 +110,22 @@ def _exact_knn(X, n_neighbors: int, metric: str):
         raise ValueError("n_neighbors must be positive")
     indices = np.empty((n, k), dtype=np.int64)
     distances = np.empty((n, k), dtype=np.float64)
-    lib().mum_exact_knn(
-        addr(data),
-        n,
-        d,
-        k,
-        _metric_code(metric),
-        addr(indices),
-        addr(distances),
-    )
+
+    def run(bound):
+        start, stop = bound
+        lib().mum_exact_knn(
+            addr(data),
+            n,
+            d,
+            k,
+            _metric_code(metric),
+            addr(indices),
+            addr(distances),
+            start,
+            stop,
+        )
+
+    _fan_out_rows(n, _KNN_FANOUT_MIN_ROWS, run)
     return indices.astype(np.int32), distances.astype(np.float32)
 
 
@@ -127,17 +150,24 @@ def _query_knn(train, query, n_neighbors: int, metric: str):
         )
     indices = np.empty((m, k), dtype=np.int64)
     distances = np.empty((m, k), dtype=np.float64)
-    lib().mum_query_knn(
-        addr(train_data),
-        addr(query_data),
-        n,
-        m,
-        d,
-        k,
-        _metric_code(metric),
-        addr(indices),
-        addr(distances),
-    )
+
+    def run(bound):
+        start, stop = bound
+        lib().mum_query_knn(
+            addr(train_data),
+            addr(query_data),
+            n,
+            m,
+            d,
+            k,
+            _metric_code(metric),
+            addr(indices),
+            addr(distances),
+            start,
+            stop,
+        )
+
+    _fan_out_rows(m, _KNN_FANOUT_MIN_ROWS, run)
     return indices.astype(np.int32), distances.astype(np.float32)
 
 
@@ -226,17 +256,25 @@ def smooth_knn_dist(
         raise RuntimeError(
             "the requested Mojo GPU kernel failed to initialize or execute"
         )
-    lib().mum_smooth_knn_dist(
-        addr(matrix),
-        n,
-        width,
-        float(k),
-        int(n_iter),
-        float(local_connectivity),
-        float(bandwidth),
-        addr(sigmas),
-        addr(rhos),
-    )
+    def run(bound):
+        start, stop = bound
+        lib().mum_smooth_knn_dist(
+            addr(matrix),
+            n,
+            width,
+            float(k),
+            int(n_iter),
+            float(local_connectivity),
+            float(bandwidth),
+            addr(sigmas),
+            addr(rhos),
+            start,
+            stop,
+        )
+
+    # smooth_knn_dist is a short per-row binary search: 0.18x threaded at
+    # n=3000 and 1.07x at n=100000, so it stays on one core.
+    run((0, n))
     return sigmas, rhos
 
 
@@ -291,20 +329,28 @@ def _membership_arrays(
     edge_distances = (
         np.empty(size, dtype=np.float32) if return_dists else None
     )
-    lib().mum_membership_strengths(
-        addr(indices),
-        addr(distances),
-        addr(sigma_values),
-        addr(rho_values),
-        n,
-        k,
-        int(bool(bipartite)),
-        addr(rows) if rows is not None else addr(cols),
-        addr(cols),
-        addr(values),
-        addr(edge_distances) if edge_distances is not None else addr(values),
-        int(bool(return_dists)),
-    )
+    def run(bound):
+        start, stop = bound
+        lib().mum_membership_strengths(
+            addr(indices),
+            addr(distances),
+            addr(sigma_values),
+            addr(rho_values),
+            n,
+            k,
+            int(bool(bipartite)),
+            addr(rows) if rows is not None else addr(cols),
+            addr(cols),
+            addr(values),
+            addr(edge_distances) if edge_distances is not None else addr(values),
+            int(bool(return_dists)),
+            start,
+            stop,
+        )
+
+    # One exp() per neighbour, O(n*k) overall: not enough work per row to pay
+    # for a thread pool.
+    run((0, n))
     returned_distances = (
         edge_distances
     )

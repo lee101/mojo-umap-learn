@@ -1,8 +1,7 @@
 """Compute kernels for exact UMAP graph construction and Euclidean embedding."""
 
-from std.algorithm import sync_parallelize
-from std.gpu import global_idx
-from std.gpu.host import DeviceContext
+from max.gpu import global_idx
+from max.gpu.host import DeviceContext
 from std.math import exp, floor, log2, pow, sqrt
 from std.sys.info import simd_width_of
 
@@ -31,25 +30,28 @@ def i32p(address: Int) -> I32Ptr:
 
 def smooth_knn_gpu_kernel(
     distances: F32Ptr,
-    n: Int,
-    k_width: Int,
+    n: Int64,
+    k_width: Int64,
     target: Float32,
-    n_iter: Int,
+    n_iter: Int64,
     local_connectivity: Float32,
     mean_distances: Float32,
     sigmas: F32Ptr,
     rhos: F32Ptr,
 ):
-    var row = global_idx.x
+    var row = Int64(global_idx.x)
     if row >= n:
         return
-    var base = row * k_width
-    var first_nonzero = k_width
-    for rank in range(k_width):
+    var count = Int(n)
+    var width = Int(k_width)
+    var iterations = Int(n_iter)
+    var base = Int(row * k_width)
+    var first_nonzero = width
+    for rank in range(width):
         if distances[base + rank] > 0.0:
             first_nonzero = rank
             break
-    var nonzero_count = k_width - first_nonzero
+    var nonzero_count = width - first_nonzero
     var rho = Float32(0.0)
     if Float32(nonzero_count) >= local_connectivity:
         var index = Int(floor(Float64(local_connectivity)))
@@ -64,15 +66,15 @@ def smooth_knn_gpu_kernel(
         elif nonzero_count > 0:
             rho = interpolation * distances[base + first_nonzero]
     elif nonzero_count > 0:
-        rho = distances[base + k_width - 1]
+        rho = distances[base + width - 1]
     rhos[row] = rho
 
     var lo = Float32(0.0)
     var hi = Float32(3.4028234663852886e38)
     var mid = Float32(1.0)
-    for iteration in range(n_iter):
+    for iteration in range(iterations):
         var probability_sum = Float32(0.0)
-        for rank in range(1, k_width):
+        for rank in range(1, width):
             var delta = distances[base + rank] - rho
             probability_sum += (
                 exp(-(delta / mid)) if delta > 0.0 else Float32(1.0)
@@ -92,9 +94,9 @@ def smooth_knn_gpu_kernel(
     var minimum_scale = Float32(0.0)
     if rho > 0.0:
         var row_mean = Float32(0.0)
-        for rank in range(k_width):
+        for rank in range(width):
             row_mean += distances[base + rank]
-        minimum_scale = 1.0e-3 * row_mean / Float32(k_width)
+        minimum_scale = 1.0e-3 * row_mean / Float32(width)
     else:
         minimum_scale = 1.0e-3 * mean_distances
     sigmas[row] = max(mid, minimum_scale)
@@ -158,12 +160,14 @@ def mum_exact_knn(
     metric: Int,
     indices_address: Int,
     distances_address: Int,
+    row_start: Int,
+    row_stop: Int,
 ) abi("C"):
     var x = fp(x_address)
     var indices = ip(indices_address)
     var distances = fp(distances_address)
 
-    @parameter
+    @__parameter
     def compute_row(row: Int):
         var base = row * k
         for rank in range(k):
@@ -173,11 +177,8 @@ def mum_exact_knn(
             var distance = metric_distance(x + row * d, x + other * d, d, metric)
             insert_neighbor(indices, distances, base, k, distance, other)
 
-    if n >= 128:
-        sync_parallelize[compute_row](n)
-    else:
-        for row in range(n):
-            compute_row(row)
+    for row in range(row_start, row_stop):
+        compute_row(row)
 
 
 @export("mum_query_knn")
@@ -191,13 +192,15 @@ def mum_query_knn(
     metric: Int,
     indices_address: Int,
     distances_address: Int,
+    row_start: Int,
+    row_stop: Int,
 ) abi("C"):
     var train = fp(train_address)
     var query = fp(query_address)
     var indices = ip(indices_address)
     var distances = fp(distances_address)
 
-    @parameter
+    @__parameter
     def compute_row(row: Int):
         var base = row * k
         for rank in range(k):
@@ -209,11 +212,8 @@ def mum_query_knn(
             )
             insert_neighbor(indices, distances, base, k, distance, other)
 
-    if m >= 128:
-        sync_parallelize[compute_row](m)
-    else:
-        for row in range(m):
-            compute_row(row)
+    for row in range(row_start, row_stop):
+        compute_row(row)
 
 
 @export("mum_smooth_knn_dist")
@@ -227,6 +227,8 @@ def mum_smooth_knn_dist(
     bandwidth: Float64,
     sigmas_address: Int,
     rhos_address: Int,
+    row_start: Int,
+    row_stop: Int,
 ) abi("C"):
     var distances = f32p(distances_address)
     var sigmas = f32p(sigmas_address)
@@ -329,20 +331,8 @@ def mum_smooth_knn_dist(
             minimum_scale = 1.0e-3 * mean_distances
         sigmas[row] = max(mid, minimum_scale)
 
-    if n >= 128:
-        var tasks = min(n, 256)
-
-        @parameter
-        def compute_chunk(task: Int):
-            var start = task * n // tasks
-            var stop = (task + 1) * n // tasks
-            for row in range(start, stop):
-                compute_row(row)
-
-        sync_parallelize[compute_chunk](tasks)
-    else:
-        for row in range(n):
-            compute_row(row)
+    for row in range(row_start, row_stop):
+        compute_row(row)
 
 
 @export("mum_smooth_knn_dist_gpu")
@@ -390,10 +380,10 @@ def mum_smooth_knn_dist_gpu(
             ctx.enqueue_copy(device_distances, distances)
             ctx.enqueue_function[smooth_knn_gpu_kernel](
                 device_distances,
-                n,
-                k_width,
+                Int64(n),
+                Int64(k_width),
                 Float32(log2(k_target) * bandwidth),
-                n_iter,
+                Int64(n_iter),
                 Float32(local_connectivity),
                 mean_distances,
                 device_sigmas,
@@ -423,6 +413,8 @@ def mum_membership_strengths(
     values_address: Int,
     edge_distances_address: Int,
     write_distances: Int,
+    row_start: Int,
+    row_stop: Int,
 ) abi("C"):
     var indices = i32p(indices_address)
     var distances = f32p(distances_address)
@@ -433,7 +425,7 @@ def mum_membership_strengths(
     var values = f32p(values_address)
     var edge_distances = f32p(edge_distances_address)
 
-    @parameter
+    @__parameter
     def compute_row(row: Int):
         for rank in range(k):
             var offset = row * k + rank
@@ -464,20 +456,8 @@ def mum_membership_strengths(
             if write_distances != 0:
                 edge_distances[offset] = distances[offset]
 
-    if n >= 128:
-        var tasks = min(n, 256)
-
-        @parameter
-        def compute_chunk(task: Int):
-            var start = task * n // tasks
-            var stop = (task + 1) * n // tasks
-            for row in range(start, stop):
-                compute_row(row)
-
-        sync_parallelize[compute_chunk](tasks)
-    else:
-        for row in range(n):
-            compute_row(row)
+    for row in range(row_start, row_stop):
+        compute_row(row)
 
 
 @export("mum_make_epochs_per_sample")

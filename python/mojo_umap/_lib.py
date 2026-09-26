@@ -15,11 +15,11 @@ I = ctypes.c_int64
 F = ctypes.c_double
 
 _SIGNATURES = {
-    "mum_exact_knn": ([I, I, I, I, I, I, I], None),
-    "mum_query_knn": ([I, I, I, I, I, I, I, I, I], None),
-    "mum_smooth_knn_dist": ([I, I, I, F, I, F, F, I, I], None),
+    "mum_exact_knn": ([I] * 9, None),
+    "mum_query_knn": ([I] * 11, None),
+    "mum_smooth_knn_dist": ([I, I, I, F, I, F, F, I, I, I, I], None),
     "mum_smooth_knn_dist_gpu": ([I, I, I, F, I, F, F, I, I], I),
-    "mum_membership_strengths": ([I] * 12, None),
+    "mum_membership_strengths": ([I] * 14, None),
     "mum_make_epochs_per_sample": ([I, I, I, I], None),
     "mum_optimize_layout_euclidean": (
         [I] * 13 + [F, F, F, F, F, I],
