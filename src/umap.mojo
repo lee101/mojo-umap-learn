@@ -246,7 +246,7 @@ def mum_smooth_knn_dist(
         var offset = 0
         while offset + W <= element_count:
             mean_distances += (
-                distances.load[width=W](offset).reduce_add()
+                distances.unsafe_load[width=W](offset).reduce_add()
             )
             offset += W
         while offset < element_count:
@@ -291,7 +291,7 @@ def mum_smooth_knn_dist(
             var rank = 1
             while rank + W <= k_width:
                 var delta = max(
-                    distances.load[width=W](base + rank) - rho,
+                    distances.unsafe_load[width=W](base + rank) - rho,
                     Float32(0.0),
                 )
                 probability_sum += exp(-(delta / mid)).reduce_add()
@@ -320,7 +320,7 @@ def mum_smooth_knn_dist(
             var rank = 0
             while rank + W <= k_width:
                 row_mean += (
-                    distances.load[width=W](base + rank).reduce_add()
+                    distances.unsafe_load[width=W](base + rank).reduce_add()
                 )
                 rank += W
             while rank < k_width:
@@ -363,7 +363,7 @@ def mum_smooth_knn_dist_gpu(
         var offset = 0
         while offset + W <= element_count:
             mean_distances += (
-                distances.load[width=W](offset).reduce_add()
+                distances.unsafe_load[width=W](offset).reduce_add()
             )
             offset += W
         while offset < element_count:
